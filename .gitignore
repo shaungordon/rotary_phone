@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+vad_prototype/venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv
+
+# Arduino / PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+firmware/.build/
+*.elf
+*.bin
+*.map
+
+# Raw sound files (large, store locally — directory is tracked but contents are not)
+sounds/raw/*
+!sounds/raw/.gitkeep
+
+# Editor
+.vscode/
+*.swp
+*.swo
