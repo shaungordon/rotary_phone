@@ -1,35 +1,81 @@
 /*
  * Rotary Phone Interface for XIAO ESP32S3
  * with Adafruit I2S MAX98357A Amplifier
- * 
- * Generates authentic US telephone tones from the 1970s
- * Supports special phone numbers with audio file playback
+ *
+ * Generates authentic US telephone tones from the 1970s.
+ * Special numbers connect to bird characters that hold an interactive
+ * conversation using VAD (energy + ZCR) to detect when the human speaks.
+ *
+ * Easter egg: dial 867-5309 for Jenny.
+ *
+ * Remote debug/config via BLE UART (NimBLE-Arduino required):
+ *   Device name: "RotaryPhone"
+ *   Compatible apps:  Bluefruit Connect (iOS)  /  Serial Bluetooth Terminal (Android)
+ *   Commands:  status | get <key> | set <key> <val> | reset
  */
 
 #include <driver/i2s.h>
-#include <LittleFS.h>
+#include <FFat.h>
+#include "config.h"
+#include "ble_debug.h"
 
-#define FILESYSTEM LittleFS
+#define FILESYSTEM FFat
+
+// ============================================================================
+// GLOBAL INSTANCES
+// ============================================================================
+ConfigManager cfg;
+BleDebug      bleDebug;
+
+// ============================================================================
+// DLOG — drop-in replacement for Serial.print/println.
+// Writes to both Serial (USB) and BLE UART simultaneously.
+// Usage:  DLOG("value=%d\n", x);   DLOG("simple message\n");
+// ============================================================================
+#define DLOG(...) do { Serial.printf(__VA_ARGS__); bleDebug.printf(__VA_ARGS__); } while(0)
 
 // ============================================================================
 // PIN DEFINITIONS
 // ============================================================================
-#define PIN_IN_USE   1  // D1 - LOW when dialing
-#define PIN_PULSE    2  // D2 - Pulses HIGH for each digit
-#define PIN_HOOK     3  // D3 - LOW when receiver off hook
+#define PIN_IN_USE    1   // D1 - LOW when dialing
+#define PIN_PULSE     2   // D2 - Pulses HIGH for each digit
+#define PIN_HOOK      3   // D3 - LOW when receiver off hook
+#define PIN_MIC_ADC   4   // A4 - Carbon mic analog input (for VAD)
 
-#define PIN_I2S_BCLK 7  // D8
-#define PIN_I2S_LRC  8  // D9
-#define PIN_I2S_DOUT 9  // D10
+#define PIN_I2S_BCLK  7  // D8
+#define PIN_I2S_LRC   8  // D9
+#define PIN_I2S_DOUT  9  // D10
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-#define SAMPLE_RATE         16000  // Lower quality = more authentic phone sound
-#define DEBOUNCE_MS         20     // Debounce time for all pins
-#define DIGITS_IN_PHONE_NUM 7      // 7-digit phone numbers
-#define IDLE_TIMEOUT_MS     10000  // 10 seconds before off-hook warning
-#define NUM_RINGS           2      // Number of rings before "answering"
+#define SAMPLE_RATE          16000  // Lower quality = more authentic phone sound
+#define DEBOUNCE_MS          20     // Debounce time for all pins
+#define DIGITS_IN_PHONE_NUM  7      // 7-digit phone numbers
+#define IDLE_TIMEOUT_MS      10000  // 10 seconds before off-hook warning
+#define NUM_RINGS            2      // Number of rings before "answering"
+
+// ============================================================================
+// VAD CONSTANTS (for bird conversation mic input)
+// ============================================================================
+// These are fallback #defines used only before cfg.load() completes.
+// At runtime the Config struct values (loaded from NVS) take precedence.
+// Calibrated for carbon handset mic, 12-bit ADC, ADC_SCALE=2048:
+//   Silence p-p ~600 counts  → AC-RMS ≈ 0.104 normalised
+//   Voice p-p  ~1680 counts  → AC-RMS ≈ 0.290 normalised
+#define VAD_CHUNK_SIZE            480     // 30ms at 16kHz
+#define VAD_SMOOTHING             0.3f    // EMA factor for energy & ZCR
+#define VAD_DC_BIAS_ALPHA         0.003f  // Slow EMA for DC tracking (~10s tau)
+#define ADC_SCALE                 2048.0f // Half of 12-bit range
+
+// Bird conversation timing (fixed - not adjustable via BLE)
+#define BIRD_PAUSE_TRIGGER_MS     800     // Silence after speech → bird responds
+#define BIRD_LOCKOUT_MS           2000    // Don't listen while bird is squawking
+#define BIRD_INITIAL_SQUAWK_MS    1200    // Pause before bird's opening squawk
+#define BIRD_PAUSE_BEFORE_MS      200     // Pause before squawk sequence
+#define BIRD_PAUSE_BETWEEN_MS     100     // Pause between squawks in a sequence
+#define BIRD_PAUSE_AFTER_MS       400     // Pause after squawk sequence
+#define MAX_SQUAWKS_PER_BIRD      16      // Maximum squawk files to probe for
 
 // ============================================================================
 // PHONE STATE MACHINE
@@ -38,7 +84,8 @@ enum PhoneState {
   STATE_ON_HOOK,        // Receiver on hook, idle
   STATE_DIAL_TONE,      // Receiver off hook, playing dial tone
   STATE_DIALING,        // User is dialing a number
-  STATE_CALL_CONNECTED, // Playing audio file (ringing + answer)
+  STATE_CALL_CONNECTED, // In a bird conversation (or just finished)
+  STATE_DISCONNECT,     // Bird hung up: disconnect tone → silence → dial tone
   STATE_ERROR,          // Invalid number or can't connect
   STATE_OFF_HOOK_WARN   // Off-hook warning tone
 };
@@ -46,7 +93,9 @@ enum PhoneState {
 PhoneState currentState = STATE_ON_HOOK;
 bool offHookWarningInitialized = false;
 bool dialToneInitialized = false;
-bool interceptRecordingPlayed = false;  // Track if intercept recording has played
+bool interceptRecordingPlayed = false;
+bool disconnectTonePlayed = false;    // Track whether disconnect tone has run
+unsigned long disconnectStartMs = 0; // When we entered STATE_DISCONNECT
 
 // ============================================================================
 // DIALING STATE
@@ -64,507 +113,689 @@ struct DebounceState {
   unsigned long lastChangeTime;
 };
 
-DebounceState hookDebounce = {HIGH, HIGH, 0};
+DebounceState hookDebounce  = {HIGH, HIGH, 0};
 DebounceState inUseDebounce = {HIGH, HIGH, 0};
-DebounceState pulseDebounce = {LOW, LOW, 0};
-
-// ============================================================================
-// TONE GENERATION
-// ============================================================================
-class ToneGenerator {
-private:
-  float phases[4];      // Up to 4 simultaneous frequencies
-  float frequencies[4];
-  int numFrequencies;
-  int16_t amplitude;
-  
-public:
-  ToneGenerator() : numFrequencies(0), amplitude(8000) {
-    for (int i = 0; i < 4; i++) {
-      phases[i] = 0;
-      frequencies[i] = 0;
-    }
-  }
-  
-  void setTone(float freq1, float freq2 = 0, float freq3 = 0, float freq4 = 0) {
-    frequencies[0] = freq1;
-    frequencies[1] = freq2;
-    frequencies[2] = freq3;
-    frequencies[3] = freq4;
-    
-    numFrequencies = 0;
-    if (freq1 > 0) numFrequencies++;
-    if (freq2 > 0) numFrequencies++;
-    if (freq3 > 0) numFrequencies++;
-    if (freq4 > 0) numFrequencies++;
-    
-    // Reset phases
-    for (int i = 0; i < 4; i++) {
-      phases[i] = 0;
-    }
-  }
-  
-  void setAmplitude(int16_t amp) {
-    amplitude = amp;
-  }
-  
-  int16_t getSample() {
-    if (numFrequencies == 0) return 0;
-    
-    float mixed = 0;
-    for (int i = 0; i < numFrequencies; i++) {
-      mixed += sin(phases[i]);
-      
-      // Increment phase
-      phases[i] += 2.0 * PI * frequencies[i] / SAMPLE_RATE;
-      
-      // Wrap phase
-      if (phases[i] >= 2.0 * PI) {
-        phases[i] -= 2.0 * PI;
-      }
-    }
-    
-    // Mix and scale
-    return (int16_t)(mixed * amplitude / numFrequencies);
-  }
-  
-  void stop() {
-    numFrequencies = 0;
-  }
-};
-
-ToneGenerator toneGen;
-
-// ============================================================================
-// CADENCED TONE (for pulsing tones like ringback and off-hook warning)
-// ============================================================================
-class CadencedTone {
-private:
-  unsigned long onDuration;
-  unsigned long offDuration;
-  unsigned long lastToggleTime;
-  bool isOn;
-  
-public:
-  CadencedTone() : onDuration(0), offDuration(0), lastToggleTime(0), isOn(false) {}
-  
-  void setCadence(unsigned long onMs, unsigned long offMs) {
-    onDuration = onMs;
-    offDuration = offMs;
-    lastToggleTime = millis();
-    isOn = true;
-  }
-  
-  bool isActive() {
-    unsigned long now = millis();
-    unsigned long elapsed = now - lastToggleTime;
-    
-    if (isOn && elapsed >= onDuration) {
-      isOn = false;
-      lastToggleTime = now;
-    } else if (!isOn && elapsed >= offDuration) {
-      isOn = true;
-      lastToggleTime = now;
-    }
-    
-    return isOn;
-  }
-  
-  void stop() {
-    onDuration = 0;
-    offDuration = 0;
-    isOn = false;
-  }
-};
-
-CadencedTone cadence;
+DebounceState pulseDebounce = {LOW,  LOW,  0};
 
 // ============================================================================
 // SPECIAL PHONE NUMBERS
 // ============================================================================
 struct PhoneNumber {
   String number;
-  String audioFile;  // Path in LittleFS
+  String birdName;  // e.g. "osprey" → squawk files: /audio/squawk_osprey_1.wav ...
 };
 
-// Define special numbers here
 PhoneNumber specialNumbers[] = {
-  {"5551234", "/audio/answer_osprey.wav"},
-  {"3218273", "/audio/answer_magpie.wav"},
-  {"9253162", "/audio/answer_cockatoo.wav"},
+  {"5551234", "osprey"},
+  {"3218273", "magpie"},
+  {"9253162", "cockatoo"},
   // Add more special numbers as needed
 };
 
 const int numSpecialNumbers = sizeof(specialNumbers) / sizeof(specialNumbers[0]);
 
 // ============================================================================
+// TONE GENERATION
+// ============================================================================
+class ToneGenerator {
+private:
+  float   phases[4];
+  float   frequencies[4];
+  int     numFrequencies;
+  int16_t amplitude;
+
+public:
+  ToneGenerator() : numFrequencies(0), amplitude(8000) {
+    for (int i = 0; i < 4; i++) { phases[i] = 0; frequencies[i] = 0; }
+  }
+
+  void setTone(float f1, float f2 = 0, float f3 = 0, float f4 = 0) {
+    frequencies[0] = f1; frequencies[1] = f2;
+    frequencies[2] = f3; frequencies[3] = f4;
+    numFrequencies = (f1>0) + (f2>0) + (f3>0) + (f4>0);
+    for (int i = 0; i < 4; i++) phases[i] = 0;
+  }
+
+  void setAmplitude(int16_t amp) { amplitude = amp; }
+
+  int16_t getSample() {
+    if (numFrequencies == 0) return 0;
+    float mixed = 0;
+    for (int i = 0; i < numFrequencies; i++) {
+      mixed += sin(phases[i]);
+      phases[i] += 2.0f * PI * frequencies[i] / SAMPLE_RATE;
+      if (phases[i] >= 2.0f * PI) phases[i] -= 2.0f * PI;
+    }
+    return (int16_t)(mixed * amplitude / numFrequencies);
+  }
+
+  void stop() { numFrequencies = 0; }
+};
+
+ToneGenerator toneGen;
+
+// ============================================================================
+// CADENCED TONE
+// ============================================================================
+class CadencedTone {
+private:
+  unsigned long onDuration, offDuration, lastToggleTime;
+  bool isOn;
+
+public:
+  CadencedTone() : onDuration(0), offDuration(0), lastToggleTime(0), isOn(false) {}
+
+  void setCadence(unsigned long onMs, unsigned long offMs) {
+    onDuration = onMs; offDuration = offMs;
+    lastToggleTime = millis(); isOn = true;
+  }
+
+  bool isActive() {
+    unsigned long now = millis(), elapsed = now - lastToggleTime;
+    if (isOn  && elapsed >= onDuration)  { isOn = false; lastToggleTime = now; }
+    if (!isOn && elapsed >= offDuration) { isOn = true;  lastToggleTime = now; }
+    return isOn;
+  }
+
+  void stop() { onDuration = 0; offDuration = 0; isOn = false; }
+};
+
+CadencedTone cadence;
+
+// ============================================================================
 // I2S AUDIO OUTPUT
 // ============================================================================
 void initI2S() {
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+  i2s_config_t icfg = {
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate          = SAMPLE_RATE,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 8,
-    .dma_buf_len = 64,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
+    .intr_alloc_flags     = 0,
+    .dma_buf_count        = 8,
+    .dma_buf_len          = 64,
+    .use_apll             = false,
+    .tx_desc_auto_clear   = true,
+    .fixed_mclk           = 0
   };
-  
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = PIN_I2S_BCLK,
-    .ws_io_num = PIN_I2S_LRC,
+  i2s_pin_config_t pins = {
+    .bck_io_num   = PIN_I2S_BCLK,
+    .ws_io_num    = PIN_I2S_LRC,
     .data_out_num = PIN_I2S_DOUT,
-    .data_in_num = I2S_PIN_NO_CHANGE
+    .data_in_num  = I2S_PIN_NO_CHANGE
   };
-  
-  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_driver_install(I2S_NUM_0, &icfg, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pins);
 }
 
+// Write one stereo sample pair with volume scaling applied.
 void writeSample(int16_t sample) {
-  int16_t samples[2];
-  samples[0] = sample;  // Left
-  samples[1] = sample;  // Right
-  
-  size_t bytes_written;
-  i2s_write(I2S_NUM_0, samples, sizeof(samples), &bytes_written, portMAX_DELAY);
+  int16_t scaled = (int16_t)(sample * cfg.current.volume);
+  int16_t stereo[2] = {scaled, scaled};
+  size_t written;
+  i2s_write(I2S_NUM_0, stereo, sizeof(stereo), &written, portMAX_DELAY);
+}
+
+// Write silence for a given number of milliseconds.
+void writeSilenceMs(uint32_t ms) {
+  uint32_t samples = (uint32_t)SAMPLE_RATE * ms / 1000;
+  for (uint32_t i = 0; i < samples; i++) writeSample(0);
 }
 
 // ============================================================================
-// DEBOUNCE FUNCTIONS
+// DEBOUNCE
 // ============================================================================
 bool debounceRead(int pin, DebounceState &state) {
   bool reading = digitalRead(pin);
   unsigned long now = millis();
-  
-  if (reading != state.lastState) {
-    state.lastChangeTime = now;
-  }
-  
-  if ((now - state.lastChangeTime) > DEBOUNCE_MS) {
-    if (reading != state.currentState) {
-      state.currentState = reading;
-    }
-  }
-  
+  if (reading != state.lastState) state.lastChangeTime = now;
+  if ((now - state.lastChangeTime) > DEBOUNCE_MS && reading != state.currentState)
+    state.currentState = reading;
   state.lastState = reading;
   return state.currentState;
 }
 
 // ============================================================================
-// AUDIO PLAYBACK
+// WAV PLAYBACK
+// Returns true  = playback completed normally.
+// Returns false = interrupted (phone hung up).
 // ============================================================================
-
-// Play a click sound for each pulse - synthesized, no file needed
-void playClickSound() {
-  toneGen.setAmplitude(3000);
-  
-  // Sharp attack - brief high frequency burst (simulates contact break)
-  toneGen.setTone(2000, 3500);
-  for (int i = 0; i < (SAMPLE_RATE * 2 / 1000); i++) {  // 2ms attack
-    writeSample(toneGen.getSample());
-  }
-  
-  // Quick decay to lower frequency
-  toneGen.setTone(800);
-  for (int i = 0; i < (SAMPLE_RATE * 3 / 1000); i++) {  // 3ms decay
-    int16_t sample = toneGen.getSample();
-    sample = sample * (1.0 - (float)i / (SAMPLE_RATE * 3 / 1000));
-    writeSample(sample);
-  }
-  
-  toneGen.stop();
-}
-
-// WAV file playback from LittleFS
-// Returns true if playback completed, false if interrupted by on-hook
 bool playWavFile(const char* path) {
-  Serial.print("[Audio] Opening: ");
-  Serial.println(path);
-  
+  DLOG("[Audio] Opening: %s\n", path);
+
   if (!FILESYSTEM.exists(path)) {
-    Serial.print("[Audio] ERROR: File does not exist: ");
-    Serial.println(path);
-    return true;
+    DLOG("[Audio] ERROR: File not found: %s\n", path);
+    return true;  // Not interrupted, just missing
   }
-  
+
   File file = FILESYSTEM.open(path, "r");
-  if (!file) {
-    Serial.print("[Audio] ERROR: Could not open file: ");
-    Serial.println(path);
+  if (!file || file.size() < 44) {
+    DLOG("[Audio] ERROR: Cannot open or too small\n");
+    if (file) file.close();
     return true;
   }
-  
-  Serial.print("[Audio] File size: ");
-  Serial.print(file.size());
-  Serial.println(" bytes");
-  
-  if (file.size() < 44) {
-    Serial.println("[Audio] ERROR: File too small to be a valid WAV");
-    file.close();
-    return true;
-  }
-  
-  // --- Parse WAV header ---
+
   uint8_t header[44];
-  if (file.read(header, 44) != 44) {
-    Serial.println("[Audio] ERROR: Could not read WAV header");
-    file.close();
-    return true;
+  if (file.read(header, 44) != 44 ||
+      header[0]!='R' || header[1]!='I' || header[2]!='F' || header[3]!='F' ||
+      header[8]!='W' || header[9]!='A' || header[10]!='V'|| header[11]!='E') {
+    DLOG("[Audio] ERROR: Invalid WAV header\n");
+    file.close(); return true;
   }
-  
-  // Validate RIFF and WAVE markers
-  if (header[0] != 'R' || header[1] != 'I' || header[2] != 'F' || header[3] != 'F' ||
-      header[8] != 'W' || header[9] != 'A' || header[10] != 'V' || header[11] != 'E') {
-    Serial.print("[Audio] ERROR: Invalid WAV header. Got: ");
-    Serial.print((char)header[0]); Serial.print((char)header[1]);
-    Serial.print((char)header[2]); Serial.println((char)header[3]);
-    file.close();
-    return true;
-  }
-  
-  // Extract format fields (little-endian)
+
   uint16_t audioFormat    = header[20] | (header[21] << 8);
   uint16_t numChannels    = header[22] | (header[23] << 8);
-  uint32_t fileSampleRate = header[24] | (header[25] << 8) | (header[26] << 16) | (header[27] << 24);
+  uint32_t fileSampleRate = header[24] | (header[25]<<8) | (header[26]<<16) | (header[27]<<24);
   uint16_t bitsPerSample  = header[34] | (header[35] << 8);
-  
-  Serial.print("[Audio] Format: ");
-  Serial.print(fileSampleRate);
-  Serial.print("Hz | ");
-  Serial.print(numChannels);
-  Serial.print("ch | ");
-  Serial.print(bitsPerSample);
-  Serial.print("bit | audioFormat=");
-  Serial.println(audioFormat);
-  
+
   if (audioFormat != 1) {
-    Serial.println("[Audio] ERROR: Only uncompressed PCM WAV supported (audioFormat must be 1)");
-    file.close();
-    return true;
+    DLOG("[Audio] ERROR: Only PCM WAV supported\n");
+    file.close(); return true;
   }
-  
-  // Find the data chunk
+
+  // Find data chunk
   uint32_t dataSize = 0;
   bool dataFound = false;
   file.seek(36);
-  uint8_t chunkHeader[8];
+  uint8_t chunkHdr[8];
   while (file.available() >= 8) {
-    file.read(chunkHeader, 8);
-    if (chunkHeader[0] == 'd' && chunkHeader[1] == 'a' &&
-        chunkHeader[2] == 't' && chunkHeader[3] == 'a') {
-      dataSize = chunkHeader[4] | (chunkHeader[5] << 8) |
-                 (chunkHeader[6] << 16) | (chunkHeader[7] << 24);
-      dataFound = true;
-      Serial.print("[Audio] Data chunk found, size: ");
-      Serial.println(dataSize);
-      break;
-    } else {
-      uint32_t chunkSize = chunkHeader[4] | (chunkHeader[5] << 8) |
-                           (chunkHeader[6] << 16) | (chunkHeader[7] << 24);
-      Serial.print("[Audio] Skipping chunk: ");
-      Serial.print((char)chunkHeader[0]); Serial.print((char)chunkHeader[1]);
-      Serial.print((char)chunkHeader[2]); Serial.print((char)chunkHeader[3]);
-      Serial.print(" ("); Serial.print(chunkSize); Serial.println(" bytes)");
-      file.seek(file.position() + chunkSize);
+    file.read(chunkHdr, 8);
+    if (chunkHdr[0]=='d' && chunkHdr[1]=='a' && chunkHdr[2]=='t' && chunkHdr[3]=='a') {
+      dataSize = chunkHdr[4] | (chunkHdr[5]<<8) | (chunkHdr[6]<<16) | (chunkHdr[7]<<24);
+      dataFound = true; break;
     }
+    uint32_t skip = chunkHdr[4] | (chunkHdr[5]<<8) | (chunkHdr[6]<<16) | (chunkHdr[7]<<24);
+    file.seek(file.position() + skip);
   }
-  
+
   if (!dataFound) {
-    Serial.println("[Audio] ERROR: No data chunk found in WAV");
-    file.close();
-    return true;
+    DLOG("[Audio] ERROR: No data chunk\n");
+    file.close(); return true;
   }
-  
-  // --- Stream audio data ---
-  // Check hook pin directly (not debounced) every buffer so we can
-  // interrupt immediately when receiver is replaced
-  const size_t bufSize = 512;
-  uint8_t buf[bufSize];
+
+  // Stream with resampling and hook interrupt check
+  const size_t BUF = 512;
+  uint8_t buf[BUF];
   uint32_t bytesPerSample = (bitsPerSample / 8) * numChannels;
   uint32_t bytesRead = 0;
-  float resampleAccum = 0.0;
-  float resampleStep = (float)fileSampleRate / (float)SAMPLE_RATE;
+  float resampleAccum = 0.0f;
+  float resampleStep  = (float)fileSampleRate / (float)SAMPLE_RATE;
   bool interrupted = false;
-  
+
   while (bytesRead < dataSize && file.available()) {
-    // Check hook state at start of each buffer - HIGH = on hook
     if (digitalRead(PIN_HOOK) == HIGH) {
-      Serial.println("[Audio] Interrupted: phone on hook");
-      interrupted = true;
-      break;
+      DLOG("[Audio] Interrupted: on hook\n");
+      interrupted = true; break;
     }
-    
-    size_t toRead = min((uint32_t)bufSize, dataSize - bytesRead);
+    size_t toRead = min((uint32_t)BUF, dataSize - bytesRead);
     toRead = (toRead / bytesPerSample) * bytesPerSample;
     if (toRead == 0) break;
-    
-    size_t actualRead = file.read(buf, toRead);
-    bytesRead += actualRead;
-    
-    for (size_t i = 0; i + bytesPerSample <= actualRead; i += bytesPerSample) {
+    size_t got = file.read(buf, toRead);
+    bytesRead += got;
+
+    for (size_t i = 0; i + bytesPerSample <= got; i += bytesPerSample) {
       int16_t sample = 0;
-      if (bitsPerSample == 16) {
-        sample = (int16_t)(buf[i] | (buf[i + 1] << 8));
-      } else if (bitsPerSample == 8) {
-        sample = ((int16_t)buf[i] - 128) << 8;
-      }
-      
-      resampleAccum += 1.0;
+      if      (bitsPerSample == 16) sample = (int16_t)(buf[i] | (buf[i+1] << 8));
+      else if (bitsPerSample == 8)  sample = ((int16_t)buf[i] - 128) << 8;
+      resampleAccum += 1.0f;
       while (resampleAccum >= resampleStep) {
         writeSample(sample);
         resampleAccum -= resampleStep;
       }
     }
   }
-  
+
   file.close();
-  if (!interrupted) {
-    Serial.print("[Audio] Done: ");
-    Serial.println(path);
-  }
   return !interrupted;
 }
 
-// Play the sound of someone picking up their receiver to answer
-// Low thud + brief electrical pop, very short and subtle
-void playAnswerClick() {
-  // Layer 1: Low mechanical thud (the handset weight)
-  // Short burst of low-frequency energy with fast decay
-  toneGen.setAmplitude(2500);
-  toneGen.setTone(60, 120);
-  int thudSamples = SAMPLE_RATE * 18 / 1000;  // 18ms
-  for (int i = 0; i < thudSamples; i++) {
-    float envelope = 1.0 - ((float)i / thudSamples);  // Linear decay
-    envelope = envelope * envelope;                     // Squared for faster drop-off
-    writeSample((int16_t)(toneGen.getSample() * envelope));
+// ============================================================================
+// SYNTHESIZED SOUNDS
+// ============================================================================
+void playClickSound() {
+  toneGen.setAmplitude(3000);
+  toneGen.setTone(2000, 3500);
+  for (int i = 0; i < SAMPLE_RATE * 2 / 1000; i++) writeSample(toneGen.getSample());
+  toneGen.setTone(800);
+  for (int i = 0; i < SAMPLE_RATE * 3 / 1000; i++) {
+    int16_t s = toneGen.getSample();
+    s = (int16_t)(s * (1.0f - (float)i / (SAMPLE_RATE * 3 / 1000)));
+    writeSample(s);
   }
-  
-  // Layer 2: Brief electrical pop (circuit closing)
-  // Very short, slightly higher frequency click
-  toneGen.setTone(800, 1600);
-  toneGen.setAmplitude(1500);
-  int popSamples = SAMPLE_RATE * 6 / 1000;  // 6ms
-  for (int i = 0; i < popSamples; i++) {
-    float envelope = 1.0 - ((float)i / popSamples);
-    writeSample((int16_t)(toneGen.getSample() * envelope));
-  }
-  
-  // Noticeable pause before the voice starts (they just picked up, bring receiver to ear)
-  int pauseSamples = SAMPLE_RATE * 600 / 1000;  // 600ms
-  for (int i = 0; i < pauseSamples; i++) {
-    writeSample(0);
-  }
-  
   toneGen.stop();
 }
-void playRingingAndAnswer(const char* audioFile) {
-  Serial.println("[Audio] Playing ringing tone...");
-  
-  // US Ringback tone: 440Hz + 480Hz, 2 seconds on, 4 seconds off
-  // On the last ring we skip the 4s silent gap so the answer
-  // click follows immediately after the tone ends
+
+// Answer click: someone on the other end picks up their handset.
+// Sharp electrical click (circuit closes) followed by a brief low thud
+// (handset leaving cradle), then silence while they raise it to their ear.
+// Research: 250-550ms from pick-up to first word; 400ms is natural mid-point.
+void playAnswerClick() {
+  // --- Sharp electrical click: dominant event, circuit snapping closed ---
+  toneGen.setAmplitude(3200);
+  toneGen.setTone(1800, 3600);
+  int click = SAMPLE_RATE * 4 / 1000;  // 4ms - short and sharp
+  for (int i = 0; i < click; i++) {
+    float env = 1.0f - (float)i / click;
+    writeSample((int16_t)(toneGen.getSample() * env));
+  }
+  toneGen.stop();
+
+  // --- Low thud: handset leaving cradle ---
+  toneGen.setTone(80, 200);
+  toneGen.setAmplitude(20000);  // High pre-scale; after VOLUME = prominent thud
+  int thud = SAMPLE_RATE * 12 / 1000;  // 12ms
+  for (int i = 0; i < thud; i++) {
+    float env = 1.0f - (float)i / thud; env *= env;  // Squared = faster dropoff
+    writeSample((int16_t)(toneGen.getSample() * env));
+  }
+  toneGen.stop();
+
+  // --- Silence: raising handset to ear (400ms) ---
+  writeSilenceMs(400);
+}
+
+// Simulated hang-up click from the bird's end.
+void playHangupClick() {
+  // --- Contact bounce: 3 tiny high-freq rebounds ---
+  int16_t bounceAmps[3]  = {2200, 1400, 800};
+  int     bounceLenMs[3] = {3,    2,    1};
+  int     gapMs          = 1;
+
+  for (int b = 0; b < 3; b++) {
+    toneGen.setTone(3500, 6000);
+    toneGen.setAmplitude(bounceAmps[b]);
+    int len = SAMPLE_RATE * bounceLenMs[b] / 1000;
+    for (int i = 0; i < len; i++) {
+      float env = 1.0f - (float)i / len;
+      writeSample((int16_t)(toneGen.getSample() * env));
+    }
+    int gap = SAMPLE_RATE * gapMs / 1000;
+    toneGen.stop();
+    for (int i = 0; i < gap; i++) writeSample(0);
+  }
+
+  // --- Electrical pop: circuit opening transient ---
+  toneGen.setTone(2800, 4800);
+  toneGen.setAmplitude(3000);
+  int pop = SAMPLE_RATE * 5 / 1000;
+  for (int i = 0; i < pop; i++) {
+    float t   = (float)i / pop;
+    float env = expf(-4.0f * t);
+    writeSample((int16_t)(toneGen.getSample() * env));
+  }
+
+  // --- Cradle thud: handset weight hitting cradle ---
+  toneGen.setTone(80, 160);
+  toneGen.setAmplitude(28000);
+  int thud = SAMPLE_RATE * 55 / 1000;
+  for (int i = 0; i < thud; i++) {
+    float t   = (float)i / thud;
+    float env = expf(-5.5f * t);
+    writeSample((int16_t)(toneGen.getSample() * env));
+  }
+
+  toneGen.stop();
+}
+
+// ============================================================================
+// HOOK-INTERRUPTIBLE SILENCE
+// Returns false immediately if the phone is hung up during the wait.
+// ============================================================================
+bool writeSilenceChecked(uint32_t ms) {
+  uint32_t samples = (uint32_t)SAMPLE_RATE * ms / 1000;
+  for (uint32_t i = 0; i < samples; i++) {
+    if (digitalRead(PIN_HOOK) == HIGH) return false;
+    writeSample(0);
+  }
+  return true;
+}
+
+// ============================================================================
+// SQUAWK FILE POOL DISCOVERY
+// Probes /audio/squawk_<birdName>_1.wav, _2.wav, ... until one is missing.
+// Returns the count found (0 if none).
+// ============================================================================
+int countSquawks(const char* birdName) {
+  int count = 0;
+  for (int n = 1; n <= MAX_SQUAWKS_PER_BIRD; n++) {
+    char path[64];
+    snprintf(path, sizeof(path), "/audio/squawk_%s_%d.wav", birdName, n);
+    if (!FILESYSTEM.exists(path)) break;
+    count++;
+  }
+  DLOG("[Bird] Squawk pool for '%s': %d file(s)\n", birdName, count);
+  return count;
+}
+
+// ============================================================================
+// RANDOM (simple LCG, seeded in setup)
+// ============================================================================
+uint32_t lcgState = 42;
+uint32_t lcgRand() {
+  lcgState = lcgState * 1664525u + 1013904223u;
+  return lcgState;
+}
+
+// ============================================================================
+// BIRD SQUAWK PLAYBACK
+// Plays 1-3 random squawks from the bird's pool.
+// Returns false if interrupted by on-hook at any point.
+// ============================================================================
+bool playBirdSquawks(const char* birdName, int squawkCount, int numSquawks) {
+  if (squawkCount == 0) {
+    DLOG("[Bird] No squawk files found - skipping\n");
+    return true;
+  }
+
+  DLOG("[Bird] Playing %d squawk(s)\n", numSquawks);
+
+  if (!writeSilenceChecked(BIRD_PAUSE_BEFORE_MS)) return false;
+
+  for (int i = 0; i < numSquawks; i++) {
+    int idx = 1 + (int)(lcgRand() % squawkCount);
+    char path[64];
+    snprintf(path, sizeof(path), "/audio/squawk_%s_%d.wav", birdName, idx);
+    DLOG("[Bird]   %s\n", path);
+    if (!playWavFile(path)) return false;
+    if (i < numSquawks - 1) {
+      if (!writeSilenceChecked(BIRD_PAUSE_BETWEEN_MS)) return false;
+    }
+  }
+
+  if (!writeSilenceChecked(BIRD_PAUSE_AFTER_MS)) return false;
+  return true;
+}
+
+// ============================================================================
+// VAD GLOBALS (used only inside runBirdConversation)
+// ============================================================================
+float vadMidpoint       = 900.0f;
+float vadSmoothedEnergy = 0.0f;
+float vadSmoothedZCR    = 0.0f;
+
+void vadWarmup() {
+  for (int i = 0; i < 200; i++) { analogRead(PIN_MIC_ADC); delayMicroseconds(100); }
+  int32_t sum = 0;
+  for (int i = 0; i < 100; i++) { sum += analogRead(PIN_MIC_ADC); delayMicroseconds(100); }
+  vadMidpoint = (float)sum / 100.0f;
+  vadSmoothedEnergy = 0.0f;
+  vadSmoothedZCR    = 0.0f;
+  DLOG("[VAD] Warmup done. Initial midpoint=%.1f\n", vadMidpoint);
+}
+
+// Sample one 30ms chunk, update vadSmoothedEnergy and vadSmoothedZCR.
+void vadSampleChunk() {
+  float sumSq = 0.0f, chunkSum = 0.0f;
+  int crossings = 0;
+  bool prevAbove = false, first = true;
+
+  for (int i = 0; i < VAD_CHUNK_SIZE; i++) {
+    int raw = analogRead(PIN_MIC_ADC);
+    chunkSum += raw;
+    float norm = (raw - vadMidpoint) / ADC_SCALE;
+    sumSq += norm * norm;
+    bool above = (raw > vadMidpoint);
+    if (!first && above != prevAbove) crossings++;
+    prevAbove = above; first = false;
+  }
+
+  float mean = chunkSum / VAD_CHUNK_SIZE;
+  vadMidpoint = (1.0f - VAD_DC_BIAS_ALPHA) * vadMidpoint + VAD_DC_BIAS_ALPHA * mean;
+
+  float rms = sqrtf(sumSq / VAD_CHUNK_SIZE);
+  vadSmoothedEnergy = VAD_SMOOTHING * vadSmoothedEnergy + (1.0f - VAD_SMOOTHING) * rms;
+  vadSmoothedZCR    = VAD_SMOOTHING * vadSmoothedZCR    + (1.0f - VAD_SMOOTHING) * (float)crossings;
+}
+
+bool vadIsSpeech() {
+  return (vadSmoothedEnergy > cfg.current.vadEnergyThreshold) &&
+         (vadSmoothedZCR >= (float)cfg.current.vadZcrThreshold);
+}
+
+// ============================================================================
+// BIRD CONVERSATION
+// Called after ringing + answer click. Runs the full interactive loop.
+// Returns true  = bird hung up (play disconnect sequence).
+// Returns false = human hung up (reset immediately, already handled by loop()).
+// ============================================================================
+bool runBirdConversation(const char* birdName, int squawkCount) {
+  DLOG("[Conv] Starting conversation with %s\n", birdName);
+
+  // --- Opening squawk after a natural pause ---
+  if (!writeSilenceChecked(BIRD_INITIAL_SQUAWK_MS)) return false;
+  int openingSquawks = 1 + (int)(lcgRand() % 2);  // 1 or 2 to open
+  if (!playBirdSquawks(birdName, squawkCount, openingSquawks)) return false;
+
+  // --- VAD setup ---
+  vadWarmup();
+
+  enum ConvVADState { CSIL, CSPEAK, CPAUSE, CLOCKOUT };
+  ConvVADState cvs = CSIL;
+  unsigned long speechStartMs  = 0;
+  unsigned long pauseStartMs   = 0;
+  unsigned long lockoutStartMs = 0;
+  unsigned long lastSpeechMs   = millis();
+
+  DLOG("[Conv] Listening...\n");
+
+  while (true) {
+    if (digitalRead(PIN_HOOK) == HIGH) {
+      DLOG("[Conv] Human hung up\n");
+      return false;
+    }
+
+    unsigned long now = millis();
+    vadSampleChunk();
+    bool speech = vadIsSpeech();
+
+    // Idle timeout: no speech detected for birdIdleTimeoutMs
+    if (cvs == CSIL && (now - lastSpeechMs) >= cfg.current.birdIdleTimeoutMs) {
+      DLOG("[Conv] Idle timeout - bird hanging up\n");
+
+      playBirdSquawks(birdName, squawkCount, 2);
+      if (digitalRead(PIN_HOOK) == HIGH) return false;
+
+      if (!writeSilenceChecked(1500)) return false;
+
+      playHangupClick();
+      writeSilenceMs(300);
+      return true;
+    }
+
+    switch (cvs) {
+      case CSIL:
+        if (speech) {
+          speechStartMs = now;
+          lastSpeechMs  = now;
+          cvs = CSPEAK;
+          DLOG("[VAD] SILENCE -> SPEAKING\n");
+        }
+        break;
+
+      case CSPEAK:
+        if (speech) lastSpeechMs = now;
+        if (!speech) {
+          pauseStartMs = now;
+          cvs = CPAUSE;
+          DLOG("[VAD] SPEAKING -> PAUSE\n");
+        }
+        break;
+
+      case CPAUSE:
+        if (speech) {
+          lastSpeechMs = now;
+          cvs = CSPEAK;
+          DLOG("[VAD] PAUSE -> SPEAKING (resumed)\n");
+        } else if (now - pauseStartMs >= BIRD_PAUSE_TRIGGER_MS) {
+          unsigned long dur = pauseStartMs - speechStartMs;
+          if (dur >= cfg.current.birdMinSpeechMs) {
+            int numSq = 1 + (int)(lcgRand() % 3);
+            DLOG("[Conv] Responding with %d squawk(s)\n", numSq);
+            if (!playBirdSquawks(birdName, squawkCount, numSq)) return false;
+            lockoutStartMs = millis();
+            cvs = CLOCKOUT;
+          } else {
+            DLOG("[VAD] PAUSE -> SILENCE (too short)\n");
+            cvs = CSIL;
+          }
+        }
+        break;
+
+      case CLOCKOUT:
+        if (now - lockoutStartMs >= BIRD_LOCKOUT_MS) {
+          vadSmoothedEnergy = 0.0f;
+          vadSmoothedZCR    = 0.0f;
+          cvs = CSIL;
+          DLOG("[VAD] LOCKOUT -> SILENCE\n");
+        }
+        break;
+    }
+  }
+}
+
+// ============================================================================
+// RINGING PREAMBLE (shared by normal calls and easter egg)
+// Plays NUM_RINGS rings, then a short gap, then the answer click.
+// Returns true  = connected (hook still down after click).
+// Returns false = interrupted (human hung up).
+// ============================================================================
+bool playRingingPreamble() {
   for (int ring = 0; ring < NUM_RINGS; ring++) {
-    Serial.print("[Audio] Ring ");
-    Serial.print(ring + 1);
-    Serial.print(" of ");
-    Serial.println(NUM_RINGS);
-    
-    bool isLastRing = (ring == NUM_RINGS - 1);
-    bool interrupted = false;
-    
-    // --- 2 second tone portion ---
+    bool isLast = (ring == NUM_RINGS - 1);
+
     toneGen.setTone(440, 480);
     toneGen.setAmplitude(8000);
-    unsigned long toneStart = millis();
-    while (millis() - toneStart < 2000) {
-      if (digitalRead(PIN_HOOK) == HIGH) {
-        Serial.println("[Audio] Ringing interrupted: phone on hook");
-        interrupted = true;
-        break;
-      }
+    unsigned long t = millis();
+    while (millis() - t < 2000) {
+      if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return false; }
       writeSample(toneGen.getSample());
     }
     toneGen.stop();
-    
-    if (interrupted) return;
-    
-    // --- 4 second silent gap (skipped on last ring) ---
-    if (!isLastRing) {
-      unsigned long silenceStart = millis();
-      while (millis() - silenceStart < 4000) {
-        if (digitalRead(PIN_HOOK) == HIGH) {
-          Serial.println("[Audio] Ringing interrupted: phone on hook");
-          return;
-        }
+
+    if (!isLast) {
+      unsigned long s = millis();
+      while (millis() - s < 4000) {
+        if (digitalRead(PIN_HOOK) == HIGH) return false;
         writeSample(0);
       }
     }
   }
-  
-  // The click of the other person picking up their receiver
-  if (digitalRead(PIN_HOOK) == LOW) {
-    playAnswerClick();
+
+  // Short gap between last ring and answer click (prevents them blending)
+  if (!writeSilenceChecked(250)) return false;
+
+  if (digitalRead(PIN_HOOK) == HIGH) return false;
+  playAnswerClick();
+
+  return (digitalRead(PIN_HOOK) == LOW);
+}
+
+// ============================================================================
+// RINGING + CONNECT (normal bird call)
+// Returns true if bird hung up (caller should enter STATE_DISCONNECT),
+// false if human hung up (loop() hook detection handles reset).
+// ============================================================================
+bool playRingingAndConnect(const char* birdName, int squawkCount) {
+  DLOG("[Audio] Ringing...\n");
+  if (!playRingingPreamble()) return false;
+  return runBirdConversation(birdName, squawkCount);
+}
+
+// ============================================================================
+// EASTER EGG: 867-5309 (Jenny)
+// Plays jenny.wav, then an answering machine beep, then silence until hangup.
+// Returns false (always human-initiated hangup here).
+// ============================================================================
+bool playJennyEasterEgg() {
+  DLOG("[Easter] 867-5309 - Jenny!\n");
+
+  // Play jenny.wav (hook-interruptible)
+  if (!playWavFile("/audio/jenny.wav")) return false;
+
+  // Brief pause before answering machine beep
+  if (!writeSilenceChecked(150)) return false;
+
+  // Classic 1980s answering machine beep: 1400Hz, ~1000ms
+  // Gentle 50ms fade-out to avoid a click at the end
+  DLOG("[Easter] Playing answering machine beep\n");
+  toneGen.setTone(1400);
+  toneGen.setAmplitude(6000);
+  int steadySamples = SAMPLE_RATE * 950 / 1000;  // 950ms steady
+  int fadeSamples   = SAMPLE_RATE * 50  / 1000;  //  50ms fade-out
+  for (int i = 0; i < steadySamples; i++) {
+    if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return false; }
+    writeSample(toneGen.getSample());
   }
-  
-  // Play the answer recording (will also self-interrupt if hook goes high)
-  playWavFile(audioFile);
-}
+  for (int i = 0; i < fadeSamples; i++) {
+    if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return false; }
+    float env = 1.0f - (float)i / fadeSamples;
+    writeSample((int16_t)(toneGen.getSample() * env));
+  }
+  toneGen.stop();
 
-// Play "cannot be connected" announcement
-void playCannotConnect() {
-  playWavFile("/audio/cannot_connect.wav");
-}
-
-// Play operator recording
-void playOperator() {
-  playWavFile("/audio/operator.wav");
+  // Silence until human hangs up (no disconnect tone — it's an answering machine)
+  DLOG("[Easter] Waiting for hangup...\n");
+  while (digitalRead(PIN_HOOK) == LOW) {
+    writeSample(0);
+  }
+  return false;
 }
 
 // ============================================================================
 // PHONE NUMBER PROCESSING
 // ============================================================================
-String lookupSpecialNumber(String number) {
+String lookupBirdName(String number) {
   for (int i = 0; i < numSpecialNumbers; i++) {
-    if (specialNumbers[i].number == number) {
-      return specialNumbers[i].audioFile;
-    }
+    if (specialNumbers[i].number == number)
+      return specialNumbers[i].birdName;
   }
-  return "";  // Not found
+  return "";
 }
 
 void processCompletedNumber() {
-  Serial.print("[Call] Number dialed: ");
-  Serial.println(dialedNumber);
-  
-  // Special case: Operator (single zero)
+  DLOG("[Call] Number dialed: %s\n", dialedNumber.c_str());
+
+  // Operator
   if (dialedNumber == "0") {
-    Serial.println("[Call] Connecting to operator");
+    DLOG("[Call] Connecting to operator\n");
     currentState = STATE_CALL_CONNECTED;
-    playOperator();
+    playWavFile("/audio/operator.wav");
     lastActivityTime = millis();
     return;
   }
-  
-  // Check if it's a special number (only if we have 7 digits)
+
+  // Easter egg: 867-5309 (Jenny)
+  if (dialedNumber == "8675309") {
+    DLOG("[Call] Easter egg: 867-5309\n");
+    currentState = STATE_CALL_CONNECTED;
+    if (playRingingPreamble()) {
+      playJennyEasterEgg();
+    }
+    lastActivityTime = millis();
+    return;
+  }
+
   if (dialedNumber.length() == DIGITS_IN_PHONE_NUM) {
-    String audioFile = lookupSpecialNumber(dialedNumber);
-    
-    if (audioFile != "") {
-      Serial.print("[Call] Special number found: ");
-      Serial.println(audioFile);
+    String birdName = lookupBirdName(dialedNumber);
+
+    if (birdName != "") {
+      DLOG("[Call] Bird: %s\n", birdName.c_str());
       currentState = STATE_CALL_CONNECTED;
-      playRingingAndAnswer(audioFile.c_str());
-      lastActivityTime = millis();
+      int squawkCount = countSquawks(birdName.c_str());
+      bool birdHungUp = playRingingAndConnect(birdName.c_str(), squawkCount);
+      if (birdHungUp && digitalRead(PIN_HOOK) == LOW) {
+        DLOG("[Call] Bird hung up - entering disconnect sequence\n");
+        currentState = STATE_DISCONNECT;
+        disconnectTonePlayed = false;
+        disconnectStartMs = millis();
+      } else {
+        lastActivityTime = millis();
+      }
     } else {
-      Serial.println("[Call] Number not recognized");
+      DLOG("[Call] Number not recognized\n");
       currentState = STATE_ERROR;
-      playCannotConnect();
+      playWavFile("/audio/cannot_connect.wav");
       lastActivityTime = millis();
     }
   }
@@ -573,73 +804,88 @@ void processCompletedNumber() {
 // ============================================================================
 // STATE MACHINE HANDLERS
 // ============================================================================
-void handleOnHook() {
-  // Just silence, waiting for phone to be picked up
-  writeSample(0);
-}
+void handleOnHook()   { writeSample(0); }
 
 void handleDialTone() {
-  // US Dial tone: 350Hz + 440Hz continuous
-  
   if (!dialToneInitialized) {
     toneGen.setTone(350, 440);
     toneGen.setAmplitude(8000);
     dialToneInitialized = true;
   }
-  
   writeSample(toneGen.getSample());
-  
-  // Check for timeout
   if (millis() - lastActivityTime > IDLE_TIMEOUT_MS) {
-    Serial.println("[Timeout] No dialing activity, switching to off-hook warning");
+    DLOG("[Timeout] Dial tone -> off-hook warning\n");
     currentState = STATE_OFF_HOOK_WARN;
-    toneGen.stop();
-    dialToneInitialized = false;
+    toneGen.stop(); dialToneInitialized = false;
   }
 }
 
 void handleDialing() {
-  // Silent while dialing (clicks are played separately)
   writeSample(0);
-  
-  // Check for timeout during dialing (partial number)
   if (millis() - lastActivityTime > IDLE_TIMEOUT_MS) {
-    Serial.println("[Timeout] Partial number dialed but no activity, switching to off-hook warning");
+    DLOG("[Timeout] Dialing -> off-hook warning\n");
     currentState = STATE_OFF_HOOK_WARN;
-    dialedNumber = "";  // Reset partial number
+    dialedNumber = "";
   }
 }
 
-// Play intercept recording for off-hook warning
-void playInterceptRecording() {
-  playWavFile("/audio/intercept_offhook.wav");
+// 30 seconds of post-disconnect silence before dial tone returns
+#define DISCONNECT_SILENCE_MS  30000
+
+void playDisconnectTone() {
+  DLOG("[Audio] Disconnect tone (2 cycles)\n");
+  for (int cycle = 0; cycle < 2; cycle++) {
+    toneGen.setTone(480, 620);
+    toneGen.setAmplitude(7000);
+    unsigned long t = millis();
+    while (millis() - t < 500) {
+      if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return; }
+      writeSample(toneGen.getSample());
+    }
+    toneGen.stop();
+    unsigned long s = millis();
+    while (millis() - s < 500) {
+      if (digitalRead(PIN_HOOK) == HIGH) return;
+      writeSample(0);
+    }
+  }
+}
+
+void handleDisconnect() {
+  if (!disconnectTonePlayed) {
+    playDisconnectTone();
+    disconnectTonePlayed = true;
+    disconnectStartMs = millis();
+  }
+
+  if (millis() - disconnectStartMs < DISCONNECT_SILENCE_MS) {
+    writeSample(0);
+    return;
+  }
+
+  DLOG("[Disconnect] Silence elapsed - returning dial tone\n");
+  currentState = STATE_DIAL_TONE;
+  dialedNumber = "";
+  currentDigit = 0;
+  lastActivityTime = millis();
+  dialToneInitialized = false;
+  offHookWarningInitialized = false;
+  interceptRecordingPlayed = false;
 }
 
 void handleOffHookWarning() {
-  // US Off-hook warning (ROH): 1400, 2060, 2450, 2600 Hz
-  // Cadence: 0.1s on, 0.1s off (very loud and annoying!)
-  // Bell System (post-1975): Play intercept recording FIRST, then the howler tone
-  
   if (!offHookWarningInitialized) {
-    // First play the intercept recording
     if (!interceptRecordingPlayed) {
-      playInterceptRecording();
+      playWavFile("/audio/intercept_offhook.wav");
       interceptRecordingPlayed = true;
     }
-    
-    // Then start the howler tone
     toneGen.setTone(1400, 2060, 2450, 2600);
-    toneGen.setAmplitude(16000);  // LOUD!
+    toneGen.setAmplitude(16000);
     cadence.setCadence(100, 100);
     offHookWarningInitialized = true;
-    Serial.println("[Audio] Off-hook warning tone started");
+    DLOG("[Audio] Off-hook warning tone started\n");
   }
-  
-  if (cadence.isActive()) {
-    writeSample(toneGen.getSample());
-  } else {
-    writeSample(0);
-  }
+  writeSample(cadence.isActive() ? toneGen.getSample() : 0);
 }
 
 // ============================================================================
@@ -648,55 +894,48 @@ void handleOffHookWarning() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Load config from NVS (or defaults if first boot)
+  cfg.load();
+
   Serial.println("\n\n=================================");
   Serial.println("Rotary Phone Interface");
+  Serial.printf("Volume: %d%%\n", (int)(cfg.current.volume * 100));
   Serial.println("=================================\n");
-  
-  // Initialize pins
-  pinMode(PIN_HOOK, INPUT_PULLUP);
-  pinMode(PIN_IN_USE, INPUT_PULLUP);
-  pinMode(PIN_PULSE, INPUT_PULLUP);
-  
-  // Initialize I2S audio
+
+  pinMode(PIN_HOOK,    INPUT_PULLUP);
+  pinMode(PIN_IN_USE,  INPUT_PULLUP);
+  pinMode(PIN_PULSE,   INPUT_PULLUP);
+  pinMode(PIN_MIC_ADC, INPUT);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
   initI2S();
-  Serial.println("[Init] I2S audio initialized");
-  
-  // Initialize LittleFS for audio files
+  Serial.println("[Init] I2S initialized");
+
   if (!FILESYSTEM.begin(true)) {
     Serial.println("[Init] LittleFS mount failed!");
   } else {
     Serial.println("[Init] LittleFS mounted");
-    Serial.print("[Init] Total bytes: ");
-    Serial.println(FILESYSTEM.totalBytes());
-    Serial.print("[Init] Used bytes:  ");
-    Serial.println(FILESYSTEM.usedBytes());
-    // List all files
-    File root = FILESYSTEM.open("/");
-    if (!root || !root.isDirectory()) {
-      Serial.println("[Init] WARNING: Could not open root directory");
-    } else {
-      File file = root.openNextFile();
-      int fileCount = 0;
-      while (file) {
-        fileCount++;
-        Serial.print("[Init] Found: ");
-        Serial.print(file.name());
-        Serial.print("  (");
-        Serial.print(file.size());
-        Serial.println(" bytes)");
-        file = root.openNextFile();
-      }
-      if (fileCount == 0) {
-        Serial.println("[Init] WARNING: No files found - was LittleFS data uploaded?");
-        Serial.println("[Init]   Arduino IDE: Tools -> ESP32 LittleFS Data Upload");
-      } else {
-        Serial.print("[Init] ");
-        Serial.print(fileCount);
-        Serial.println(" file(s) found");
-      }
+    for (int i = 0; i < numSpecialNumbers; i++) {
+      countSquawks(specialNumbers[i].birdName.c_str());
     }
   }
-  
+
+  lcgState = (uint32_t)analogRead(PIN_MIC_ADC) ^ (uint32_t)millis();
+
+  // Start BLE advertising (after LittleFS so Serial is fully up)
+  bleDebug.begin("RotaryPhone");
+
+  // Log current config over both Serial and BLE ring buffer
+  DLOG("[Config] volume=%.2f vadEnergy=%.3f vadZcr=%d minSpeech=%u idleTimeout=%u\n",
+       cfg.current.volume,
+       cfg.current.vadEnergyThreshold,
+       cfg.current.vadZcrThreshold,
+       cfg.current.birdMinSpeechMs,
+       cfg.current.birdIdleTimeoutMs);
+
   Serial.println("[Ready] Waiting for phone activity...\n");
 }
 
@@ -704,144 +943,90 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-  // Read debounced pin states
-  bool hookOffHook = !debounceRead(PIN_HOOK, hookDebounce);     // LOW = off hook
-  bool inUseActive = !debounceRead(PIN_IN_USE, inUseDebounce);  // LOW = dialing
-  bool pulseHigh = debounceRead(PIN_PULSE, pulseDebounce);      // HIGH = pulse
-  
-  // ============================================================
-  // Hook state change detection (highest priority)
-  // ============================================================
+  // Process any pending BLE commands (set/get/status/reset)
+  bleDebug.loop();
+
+  bool hookOffHook = !debounceRead(PIN_HOOK,    hookDebounce);
+  bool inUseActive = !debounceRead(PIN_IN_USE,  inUseDebounce);
+  bool pulseHigh   =  debounceRead(PIN_PULSE,   pulseDebounce);
+
   static bool lastHookState = false;
-  
+
   if (hookOffHook && !lastHookState) {
-    // Phone just picked up
-    Serial.println("\n[Event] Phone OFF HOOK");
+    DLOG("\n[Event] Phone OFF HOOK\n");
     currentState = STATE_DIAL_TONE;
-    dialedNumber = "";
-    currentDigit = 0;
+    dialedNumber = ""; currentDigit = 0;
     lastActivityTime = millis();
     dialToneInitialized = false;
     offHookWarningInitialized = false;
     interceptRecordingPlayed = false;
-    toneGen.setTone(350, 440);  // Start dial tone
+    toneGen.setTone(350, 440);
   } else if (!hookOffHook && lastHookState) {
-    // Phone just hung up
-    Serial.println("\n[Event] Phone ON HOOK - Resetting");
+    DLOG("\n[Event] Phone ON HOOK - Resetting\n");
     currentState = STATE_ON_HOOK;
-    dialedNumber = "";
-    currentDigit = 0;
+    dialedNumber = ""; currentDigit = 0;
     dialToneInitialized = false;
     offHookWarningInitialized = false;
     interceptRecordingPlayed = false;
-    toneGen.stop();
-    cadence.stop();
+    disconnectTonePlayed = false;
+    toneGen.stop(); cadence.stop();
   }
-  
   lastHookState = hookOffHook;
-  
-  // ============================================================
-  // Only process dialing if phone is off hook AND in dialable state
-  // ============================================================
+
   if (hookOffHook && (currentState == STATE_DIAL_TONE || currentState == STATE_DIALING)) {
-    // Detect start of dialing
     static bool lastInUseState = false;
     if (inUseActive && !lastInUseState) {
-      Serial.println("[Event] Started dialing");
+      DLOG("[Event] Started dialing\n");
       if (currentState == STATE_DIAL_TONE) {
         currentState = STATE_DIALING;
-        toneGen.stop();  // Stop dial tone
-        dialToneInitialized = false;
+        toneGen.stop(); dialToneInitialized = false;
       }
-      currentDigit = 0;  // Reset pulse counter
-      lastActivityTime = millis();
+      currentDigit = 0; lastActivityTime = millis();
     }
     lastInUseState = inUseActive;
-    
-    // Count pulses while dialing
+
     static bool lastPulseState = false;
     if (inUseActive && pulseHigh && !lastPulseState) {
       currentDigit++;
-      playClickSound();  // Audible feedback
-      Serial.print("  [Pulse] ");
-      Serial.println(currentDigit);
+      playClickSound();
+      DLOG("  [Pulse] %d\n", currentDigit);
       lastActivityTime = millis();
     }
     lastPulseState = pulseHigh;
-    
-    // Detect end of digit dialing
+
     static bool wasDialing = false;
     if (!inUseActive && wasDialing && currentDigit > 0) {
-      // Digit complete
-      int digit = (currentDigit == 10) ? 0 : currentDigit;  // 10 pulses = 0
+      int digit = (currentDigit == 10) ? 0 : currentDigit;
       dialedNumber += String(digit);
-      Serial.print("[Digit] Dialed: ");
-      Serial.print(digit);
-      Serial.print(" (Number so far: ");
-      Serial.print(dialedNumber);
-      Serial.println(")");
-      
-      currentDigit = 0;
-      lastActivityTime = millis();
-      
-      // Special case: Check for operator (single 0)
+      DLOG("[Digit] %d  (so far: %s)\n", digit, dialedNumber.c_str());
+      currentDigit = 0; lastActivityTime = millis();
+
       if (dialedNumber == "0") {
-        Serial.println("[Event] Operator number detected");
         processCompletedNumber();
-      }
-      // Check if complete 7-digit number
-      else if (dialedNumber.length() >= DIGITS_IN_PHONE_NUM) {
-        Serial.println("[Event] Complete phone number dialed");
+      } else if (dialedNumber.length() >= DIGITS_IN_PHONE_NUM) {
         processCompletedNumber();
       }
     }
-    wasDialing = inUseActive;    
-    // Check timeout during connected call or error
-    if ((currentState == STATE_CALL_CONNECTED || currentState == STATE_ERROR) &&
-        millis() - lastActivityTime > IDLE_TIMEOUT_MS) {
-      Serial.println("[Timeout] Call completed but phone still off hook");
-      currentState = STATE_OFF_HOOK_WARN;
-      toneGen.stop();
-      cadence.stop();
-      offHookWarningInitialized = false;
-    }
-  } else if (hookOffHook) {
-    // Phone is off hook but in a non-dialable state (CALL_CONNECTED, ERROR, OFF_HOOK_WARN)
-    // Check timeout during connected call or error
-    if ((currentState == STATE_CALL_CONNECTED || currentState == STATE_ERROR) &&
-        millis() - lastActivityTime > IDLE_TIMEOUT_MS) {
-      Serial.println("[Timeout] Call/error completed but phone still off hook");
-      currentState = STATE_OFF_HOOK_WARN;
-      toneGen.stop();
-      cadence.stop();
-      offHookWarningInitialized = false;
-    }
+    wasDialing = inUseActive;
   }
-  
-  // ============================================================
-  // Execute current state
-  // ============================================================
+
+  // Timeout from CALL_CONNECTED or ERROR → off-hook warning
+  if (hookOffHook &&
+      (currentState == STATE_CALL_CONNECTED || currentState == STATE_ERROR) &&
+      millis() - lastActivityTime > IDLE_TIMEOUT_MS) {
+    DLOG("[Timeout] Call ended, phone still off hook\n");
+    currentState = STATE_OFF_HOOK_WARN;
+    toneGen.stop(); cadence.stop();
+    offHookWarningInitialized = false;
+  }
+
   switch (currentState) {
-    case STATE_ON_HOOK:
-      handleOnHook();
-      break;
-      
-    case STATE_DIAL_TONE:
-      handleDialTone();
-      break;
-      
-    case STATE_DIALING:
-      handleDialing();
-      break;
-      
+    case STATE_ON_HOOK:        handleOnHook();         break;
+    case STATE_DIAL_TONE:      handleDialTone();        break;
+    case STATE_DIALING:        handleDialing();         break;
     case STATE_CALL_CONNECTED:
-    case STATE_ERROR:
-      // Audio already played, just output silence
-      writeSample(0);
-      break;
-      
-    case STATE_OFF_HOOK_WARN:
-      handleOffHookWarning();
-      break;
+    case STATE_ERROR:          writeSample(0);          break;
+    case STATE_DISCONNECT:     handleDisconnect();      break;
+    case STATE_OFF_HOOK_WARN:  handleOffHookWarning();  break;
   }
 }
