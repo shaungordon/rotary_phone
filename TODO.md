@@ -1,10 +1,11 @@
 # TODO
 
 ## Firmware
-- [ ] Port VAD algorithm from `vad_prototype/` to ESP32S3 C++
-- [ ] Integrate VAD with bird response playback in state machine
+- [x] Port VAD algorithm from `vad_prototype/` to ESP32S3 C++
+- [x] Integrate VAD with bird response playback in state machine
 - [ ] Test VAD thresholds on actual phone handset microphone
 - [ ] Add more bird characters / phone numbers
+- [x] Convert `.ino` sketches to `.cpp` for improved IDE support and stability
 
 ## Audio
 - [ ] Record/source additional bird vocalizations
@@ -18,4 +19,4 @@
 ## Project
 - [ ] Document hardware wiring / pin assignments
 - [ ] Write installation / setup instructions
-- [ ] BLE device name: append last 4 hex digits of MAC address (e.g. "RotaryPhone-A3F1") so multiple units are distinguishable without conflicts
+- [x] BLE device name: append last 4 hex digits of MAC address (e.g. "RotaryPhone-A3F1") so multiple units are distinguishable without conflicts

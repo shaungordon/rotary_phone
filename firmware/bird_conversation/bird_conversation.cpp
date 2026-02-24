@@ -17,6 +17,7 @@
  *   MAX98357A DIN  → GPIO 9
  */
 
+#include <Arduino.h>
 #include <driver/i2s.h>
 #include <LittleFS.h>
 
@@ -113,6 +114,18 @@ unsigned long lockoutStartMs = 0;
 float smoothedEnergy = 0.0f;
 float smoothedZCR = 0.0f;
 int responseCount = 0;
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+void initI2S();
+void writeSilence(uint32_t durationMs);
+bool playWavFile(const char* path);
+uint32_t lcgRand();
+void playBirdResponse();
+void warmupADC();
+void sampleMicFeatures();
+void updateVAD();
 
 // ============================================================================
 // I2S AUDIO OUTPUT

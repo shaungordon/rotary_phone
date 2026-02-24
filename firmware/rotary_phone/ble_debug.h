@@ -70,8 +70,9 @@ public:
     esp_read_mac(mac, ESP_MAC_BT);
     char uniqueName[24];
     snprintf(uniqueName, sizeof(uniqueName), "%s-%02X%02X", deviceName, mac[4], mac[5]);
+    
     NimBLEDevice::init(uniqueName);
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max TX power (~+9 dBm)
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
     _server = NimBLEDevice::createServer();
     _server->setCallbacks(this);
@@ -93,10 +94,25 @@ public:
     _rxChar->setCallbacks(this);
 
     nus->start();
-    // Include NUS UUID in primary advertisement so macOS Core Bluetooth
-    // surfaces the device when scanning for specific service UUIDs.
-    NimBLEDevice::getAdvertising()->addServiceUUID(NUS_SERVICE_UUID);
-    NimBLEDevice::startAdvertising();
+
+    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+
+    // Best strategy for macOS: Name and Flags in Primary, Service UUID in Scan Response.
+    NimBLEAdvertisementData advData;
+    advData.setFlags(0x06); // General Discoverable | BR/EDR Not Supported
+    advData.setAppearance(0x0040); // Generic Phone
+    advData.setName(uniqueName);
+    pAdvertising->setAdvertisementData(advData);
+
+    NimBLEAdvertisementData scanResponseData;
+    scanResponseData.addServiceUUID(NUS_SERVICE_UUID);
+    pAdvertising->setScanResponseData(scanResponseData);
+
+    // Reliable Advertising (100ms)
+    pAdvertising->setMinInterval(160); 
+    pAdvertising->setMaxInterval(320);
+
+    pAdvertising->start();
 
     Serial.printf("[BLE] Advertising as \"%s\"\n", uniqueName);
   }
@@ -133,9 +149,14 @@ public:
   // ------------------------------------------------------------------
   // NimBLE CALLBACKS (must be public for inheritance)
   // ------------------------------------------------------------------
-  void onConnect(NimBLEServer* /*s*/, NimBLEConnInfo& /*connInfo*/) override {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     _connected = true;
     Serial.println("[BLE] Client connected");
+
+    // Optimize connection parameters for low latency and stability.
+    // 15ms min, 30ms max, 0 latency, 4s timeout (400 * 10ms)
+    pServer->updateConnParams(connInfo.getConnHandle(), 12, 24, 0, 400);
+
     _dumpHistory();
     _sendLine("[BLE] RotaryPhone connected. Type 'status' for config.\n");
   }

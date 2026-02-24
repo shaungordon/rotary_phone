@@ -11,6 +11,8 @@
  * No VAD, no audio output, no LittleFS - bare` minimum.
  */
 
+#include <Arduino.h>
+
 // ADC pin - same as bird_conversation sketch
 #define PIN_MIC_ADC   4    // A4 - mic signal input
 

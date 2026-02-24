@@ -14,12 +14,43 @@
  *   Commands:  status | get <key> | set <key> <val> | reset
  */
 
+#include <Arduino.h>
 #include <driver/i2s.h>
 #include <FFat.h>
 #include "config.h"
 #include "ble_debug.h"
 
 #define FILESYSTEM FFat
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+void initI2S();
+void writeSample(int16_t sample);
+void writeSilenceMs(uint32_t ms);
+bool playWavFile(const char* path);
+void playClickSound();
+void playAnswerClick();
+void playHangupClick();
+bool writeSilenceChecked(uint32_t ms);
+int countSquawks(const char* birdName);
+uint32_t lcgRand();
+bool playBirdSquawks(const char* birdName, int squawkCount, int numSquawks);
+void vadWarmup();
+void vadSampleChunk();
+bool vadIsSpeech();
+bool runBirdConversation(const char* birdName, int squawkCount);
+bool playRingingPreamble();
+bool playRingingAndConnect(const char* birdName, int squawkCount);
+bool playJennyEasterEgg();
+String lookupBirdName(String number);
+void processCompletedNumber();
+void handleOnHook();
+void handleDialTone();
+void handleDialing();
+void playDisconnectTone();
+void handleDisconnect();
+void handleOffHookWarning();
 
 // ============================================================================
 // GLOBAL INSTANCES
@@ -732,7 +763,7 @@ bool playJennyEasterEgg() {
   DLOG("[Easter] Playing answering machine beep\n");
   toneGen.setTone(1400);
   toneGen.setAmplitude(6000);
-  int steadySamples = SAMPLE_RATE * 450 / 1000;  // 450ms steady
+  int steadySamples = SAMPLE_RATE * 950 / 1000;  // 450ms steady
   int fadeSamples   = SAMPLE_RATE * 50  / 1000;  //  50ms fade-out
   for (int i = 0; i < steadySamples; i++) {
     if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return false; }
