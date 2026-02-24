@@ -80,7 +80,7 @@ BleDebug      bleDebug;
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-#define SAMPLE_RATE          16000  // Lower quality = more authentic phone sound
+#define SAMPLE_RATE          8000   // POTS standard — authentic 1970s phone sound
 #define DEBOUNCE_MS          20     // Debounce time for all pins
 #define DIGITS_IN_PHONE_NUM  7      // 7-digit phone numbers
 #define IDLE_TIMEOUT_MS      10000  // 10 seconds before off-hook warning
@@ -94,7 +94,7 @@ BleDebug      bleDebug;
 // Calibrated for carbon handset mic, 12-bit ADC, ADC_SCALE=2048:
 //   Silence p-p ~600 counts  → AC-RMS ≈ 0.104 normalised
 //   Voice p-p  ~1680 counts  → AC-RMS ≈ 0.290 normalised
-#define VAD_CHUNK_SIZE            480     // 30ms at 16kHz
+#define VAD_CHUNK_SIZE            240     // 30ms at 8kHz
 #define VAD_SMOOTHING             0.3f    // EMA factor for energy & ZCR
 #define VAD_DC_BIAS_ALPHA         0.003f  // Slow EMA for DC tracking (~10s tau)
 #define ADC_SCALE                 2048.0f // Half of 12-bit range
@@ -244,9 +244,9 @@ public:
 
 CadencedTone cadence;
 
-// true while a bird conversation is active (between answer click and hangup click).
-// writeSample uses full hiss amplitude (±20) during conversation, half (±10) elsewhere.
-static bool g_birdConvActive = false;
+// true while a call is connected (bird conversation or Jenny easter egg).
+// writeSample uses full hiss amplitude (±20) during connected call, half (±10) elsewhere.
+static bool g_callConnected = false;
 
 // ============================================================================
 // I2S AUDIO OUTPUT
@@ -279,9 +279,9 @@ void initI2S() {
 // Adds subtle "comfort noise" (line hiss) whenever the phone is off-hook.
 void writeSample(int16_t sample) {
   // Add background hiss if off-hook.
-  // Full amplitude (±20) during bird conversation; half (±10) everywhere else.
+  // Full amplitude (±20) during connected call; half (±10) everywhere else.
   if (digitalRead(PIN_HOOK) == LOW) {
-    int16_t amp = g_birdConvActive ? 20 : 10;
+    int16_t amp = g_callConnected ? 20 : 10;
     sample += (int16_t)((rand() % (2 * amp + 1)) - amp);
   }
 
@@ -646,6 +646,7 @@ bool runBirdConversation(const char* birdName, int squawkCount) {
 
   // --- VAD setup ---
   vadWarmup();
+  writeSilenceMs(64);   // pre-fill DMA to capacity before VAD loop
 
   enum ConvVADState { CSIL, CSPEAK, CPAUSE, CLOCKOUT };
   ConvVADState cvs = CSIL;
@@ -663,8 +664,8 @@ bool runBirdConversation(const char* birdName, int squawkCount) {
     }
 
     unsigned long now = millis();
-    writeSilenceMs(30);  // pre-fill DMA before VAD sampling
-    vadSampleChunk();
+    vadSampleChunk();           // ADC first — drains buffer ~12-16 samples at 8kHz
+    writeSilenceMs(30);         // refills deficit immediately, then rate-limited
     bool speech = vadIsSpeech();
 
     // Periodic readout for threshold tuning (~every 300ms).
@@ -787,9 +788,9 @@ bool playRingingPreamble() {
 bool playRingingAndConnect(const char* birdName, int squawkCount) {
   DLOG("[Audio] Ringing...\n");
   if (!playRingingPreamble()) return false;
-  g_birdConvActive = true;   // full hiss from answer click through conversation
+  g_callConnected = true;   // full hiss from answer click through conversation
   bool birdHungUp = runBirdConversation(birdName, squawkCount);
-  g_birdConvActive = false;  // back to half hiss after bird conversation ends
+  g_callConnected = false;  // back to half hiss after bird conversation ends
   if (birdHungUp) lastActivityTime = millis(); // Reset timer for silence delay
   return birdHungUp;
 }
@@ -875,7 +876,10 @@ void processCompletedNumber() {
     DLOG("[Call] Easter egg: 867-5309\n");
     currentState = STATE_CALL_CONNECTED;
     if (playRingingPreamble()) {
-      if (playJennyEasterEgg() && digitalRead(PIN_HOOK) == LOW) {
+      g_callConnected = true;
+      bool done = playJennyEasterEgg();
+      g_callConnected = false;
+      if (done && digitalRead(PIN_HOOK) == LOW) {
         DLOG("[Call] Machine hung up - entering disconnect sequence\n");
         playHangupClick();
         currentState = STATE_DISCONNECT;
