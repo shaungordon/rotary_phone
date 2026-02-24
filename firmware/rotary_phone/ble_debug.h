@@ -36,6 +36,7 @@
 #pragma once
 #include <NimBLEDevice.h>
 #include <stdarg.h>
+#include "esp_system.h"
 #include "config.h"
 
 // ============================================================================
@@ -61,9 +62,15 @@ public:
   // PUBLIC API
   // ------------------------------------------------------------------
 
-  // Call once in setup(). Starts advertising as deviceName over BLE.
+  // Call once in setup(). Starts advertising as "RotaryPhone-XXXX" where
+  // XXXX is the last 4 hex digits of the BT MAC address, ensuring each
+  // unit has a unique, identifiable name.
   void begin(const char* deviceName = "RotaryPhone") {
-    NimBLEDevice::init(deviceName);
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_BT);
+    char uniqueName[24];
+    snprintf(uniqueName, sizeof(uniqueName), "%s-%02X%02X", deviceName, mac[4], mac[5]);
+    NimBLEDevice::init(uniqueName);
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max TX power (~+9 dBm)
 
     _server = NimBLEDevice::createServer();
@@ -86,9 +93,12 @@ public:
     _rxChar->setCallbacks(this);
 
     nus->start();
+    // Include NUS UUID in primary advertisement so macOS Core Bluetooth
+    // surfaces the device when scanning for specific service UUIDs.
+    NimBLEDevice::getAdvertising()->addServiceUUID(NUS_SERVICE_UUID);
     NimBLEDevice::startAdvertising();
 
-    Serial.printf("[BLE] Advertising as \"%s\"\n", deviceName);
+    Serial.printf("[BLE] Advertising as \"%s\"\n", uniqueName);
   }
 
   // Call at the top of loop() — processes any pending received command.

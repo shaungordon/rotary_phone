@@ -1,0 +1,7 @@
+# Name,     Type, SubType, Offset,   Size
+# Total flash: 8MB = 0x800000
+# nvs + otadata + app0 + ffat = 0x5000 + 0x2000 + 0x300000 + 0x4F0000 = 0x800000 - 0x9000 (bootloader)
+nvs,         data, nvs,    0x9000,   0x5000
+otadata,     data, ota,    0xe000,   0x2000
+app0,        app,  factory,0x10000,  0x300000
+ffat,        data, fat,    0x310000, 0x4F0000

@@ -589,6 +589,17 @@ bool runBirdConversation(const char* birdName, int squawkCount) {
     vadSampleChunk();
     bool speech = vadIsSpeech();
 
+    // Periodic readout for threshold tuning (~every 300ms).
+    // Shows live energy/ZCR vs current thresholds so you can calibrate.
+    static uint8_t vadLogTick = 0;
+    if (++vadLogTick >= 10) {
+      vadLogTick = 0;
+      DLOG("[VAD] e=%.4f(>%.4f) z=%.1f(>=%d) %s\n",
+           vadSmoothedEnergy, cfg.current.vadEnergyThreshold,
+           vadSmoothedZCR,    cfg.current.vadZcrThreshold,
+           speech ? "SPEECH" : "sil");
+    }
+
     // Idle timeout: no speech detected for birdIdleTimeoutMs
     if (cvs == CSIL && (now - lastSpeechMs) >= cfg.current.birdIdleTimeoutMs) {
       DLOG("[Conv] Idle timeout - bird hanging up\n");
@@ -716,12 +727,12 @@ bool playJennyEasterEgg() {
   // Brief pause before answering machine beep
   if (!writeSilenceChecked(150)) return false;
 
-  // Classic 1980s answering machine beep: 1400Hz, ~1000ms
+  // Classic 1980s answering machine beep: 1400Hz, ~500ms
   // Gentle 50ms fade-out to avoid a click at the end
   DLOG("[Easter] Playing answering machine beep\n");
   toneGen.setTone(1400);
   toneGen.setAmplitude(6000);
-  int steadySamples = SAMPLE_RATE * 950 / 1000;  // 950ms steady
+  int steadySamples = SAMPLE_RATE * 450 / 1000;  // 450ms steady
   int fadeSamples   = SAMPLE_RATE * 50  / 1000;  //  50ms fade-out
   for (int i = 0; i < steadySamples; i++) {
     if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return false; }

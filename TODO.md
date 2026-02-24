@@ -18,3 +18,4 @@
 ## Project
 - [ ] Document hardware wiring / pin assignments
 - [ ] Write installation / setup instructions
+- [ ] BLE device name: append last 4 hex digits of MAC address (e.g. "RotaryPhone-A3F1") so multiple units are distinguishable without conflicts
