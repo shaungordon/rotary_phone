@@ -261,7 +261,14 @@ void initI2S() {
 }
 
 // Write one stereo sample pair with volume scaling applied.
+// Adds subtle "comfort noise" (line hiss) whenever the phone is off-hook.
 void writeSample(int16_t sample) {
+  // Add very subtle background hiss if off-hook. 
+  // rand() % 41 - 20 gives a range of -20 to +20.
+  if (digitalRead(PIN_HOOK) == LOW) {
+    sample += (int16_t)((rand() % 41) - 20);
+  }
+
   int16_t scaled = (int16_t)(sample * cfg.current.volume);
   int16_t stereo[2] = {scaled, scaled};
   size_t written;
@@ -798,14 +805,21 @@ String lookupBirdName(String number) {
 void processCompletedNumber() {
   DLOG("[Call] Number dialed: %s\n", dialedNumber.c_str());
 
-  // Operator
-  if (dialedNumber == "0") {
-    DLOG("[Call] Connecting to operator\n");
-    currentState = STATE_CALL_CONNECTED;
-    playWavFile("/audio/operator.wav");
-    lastActivityTime = millis();
-    return;
-  }
+    // Operator
+    if (dialedNumber == "0") {
+        DLOG("[Call] Connecting to operator\n");
+        currentState = STATE_CALL_CONNECTED;
+        if (playWavFile("/audio/operator.wav") && digitalRead(PIN_HOOK) == LOW) {
+          DLOG("[Call] Operator hung up - entering disconnect sequence\n");
+          playHangupClick();
+          currentState = STATE_DISCONNECT;
+          disconnectTonePlayed = false;
+          disconnectStartMs = millis();
+        } else {
+          lastActivityTime = millis();
+        }
+        return;
+    }
 
   // Easter egg: 867-5309 (Jenny)
   if (dialedNumber == "8675309") {
@@ -828,6 +842,10 @@ void processCompletedNumber() {
       bool birdHungUp = playRingingAndConnect(birdName.c_str(), squawkCount);
       if (birdHungUp && digitalRead(PIN_HOOK) == LOW) {
         DLOG("[Call] Bird hung up - entering disconnect sequence\n");
+        
+        // 1970s authenticity: play the physical hangup click before silence
+        playHangupClick();
+        
         currentState = STATE_DISCONNECT;
         disconnectTonePlayed = false;
         disconnectStartMs = millis();
@@ -894,25 +912,24 @@ void playDisconnectTone() {
 }
 
 void handleDisconnect() {
+  // 1970s Network Authenticity: After the bird hangs up, the line stays 
+  // silent (with comfort noise) until the off-hook timeout triggers the howler.
+  // No immediate beeps, no automatic return of dial tone.
+  
   if (!disconnectTonePlayed) {
-    playDisconnectTone();
+    // We already played the hangup click before entering this state.
     disconnectTonePlayed = true;
     disconnectStartMs = millis();
+    DLOG("[Disconnect] Line is now silent. Waiting for off-hook timeout.\n");
   }
 
-  if (millis() - disconnectStartMs < DISCONNECT_SILENCE_MS) {
-    writeSample(0);
-    return;
-  }
+  writeSample(0); // writeSample adds comfort noise automatically
 
-  DLOG("[Disconnect] Silence elapsed - returning dial tone\n");
-  currentState = STATE_DIAL_TONE;
-  dialedNumber = "";
-  currentDigit = 0;
-  lastActivityTime = millis();
-  dialToneInitialized = false;
-  offHookWarningInitialized = false;
-  interceptRecordingPlayed = false;
+  if (millis() - lastActivityTime > IDLE_TIMEOUT_MS) {
+    DLOG("[Timeout] Post-disconnect silence -> off-hook warning\n");
+    currentState = STATE_OFF_HOOK_WARN;
+    offHookWarningInitialized = false;
+  }
 }
 
 void handleOffHookWarning() {
