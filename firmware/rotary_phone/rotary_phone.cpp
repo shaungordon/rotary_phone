@@ -116,9 +116,9 @@ enum PhoneState {
   STATE_DIAL_TONE,      // Receiver off hook, playing dial tone
   STATE_DIALING,        // User is dialing a number
   STATE_CALL_CONNECTED, // In a bird conversation (or just finished)
-  STATE_DISCONNECT,     // Bird hung up: disconnect tone → silence → dial tone
+  STATE_DISCONNECT,     // Bird hung up: dead silence (with hiss)
   STATE_ERROR,          // Invalid number or can't connect
-  STATE_OFF_HOOK_WARN   // Off-hook warning tone
+  STATE_OFF_HOOK_WARN   // Off-hook warning tone (Howler)
 };
 
 PhoneState currentState = STATE_ON_HOOK;
@@ -222,9 +222,20 @@ public:
   }
 
   bool isActive() {
-    unsigned long now = millis(), elapsed = now - lastToggleTime;
-    if (isOn  && elapsed >= onDuration)  { isOn = false; lastToggleTime = now; }
-    if (!isOn && elapsed >= offDuration) { isOn = true;  lastToggleTime = now; }
+    if (onDuration == 0) return true;
+    unsigned long now = millis();
+    unsigned long elapsed = now - lastToggleTime;
+    if (isOn) {
+      if (elapsed >= onDuration) {
+        isOn = false;
+        lastToggleTime = now;
+      }
+    } else {
+      if (elapsed >= offDuration) {
+        isOn = true;
+        lastToggleTime = now;
+      }
+    }
     return isOn;
   }
 
@@ -232,6 +243,10 @@ public:
 };
 
 CadencedTone cadence;
+
+// true while a bird conversation is active (between answer click and hangup click).
+// writeSample uses full hiss amplitude (±20) during conversation, half (±10) elsewhere.
+static bool g_birdConvActive = false;
 
 // ============================================================================
 // I2S AUDIO OUTPUT
@@ -263,10 +278,11 @@ void initI2S() {
 // Write one stereo sample pair with volume scaling applied.
 // Adds subtle "comfort noise" (line hiss) whenever the phone is off-hook.
 void writeSample(int16_t sample) {
-  // Add very subtle background hiss if off-hook. 
-  // rand() % 41 - 20 gives a range of -20 to +20.
+  // Add background hiss if off-hook.
+  // Full amplitude (±20) during bird conversation; half (±10) everywhere else.
   if (digitalRead(PIN_HOOK) == LOW) {
-    sample += (int16_t)((rand() % 41) - 20);
+    int16_t amp = g_birdConvActive ? 20 : 10;
+    sample += (int16_t)((rand() % (2 * amp + 1)) - amp);
   }
 
   int16_t scaled = (int16_t)(sample * cfg.current.volume);
@@ -276,9 +292,13 @@ void writeSample(int16_t sample) {
 }
 
 // Write silence for a given number of milliseconds.
+// Comfort noise is added automatically by writeSample().
 void writeSilenceMs(uint32_t ms) {
   uint32_t samples = (uint32_t)SAMPLE_RATE * ms / 1000;
-  for (uint32_t i = 0; i < samples; i++) writeSample(0);
+  for (uint32_t i = 0; i < samples; i++) {
+    // If the phone is on-hook during silence, stop hiss immediately
+    writeSample(0);
+  }
 }
 
 // ============================================================================
@@ -484,6 +504,9 @@ bool writeSilenceChecked(uint32_t ms) {
   uint32_t samples = (uint32_t)SAMPLE_RATE * ms / 1000;
   for (uint32_t i = 0; i < samples; i++) {
     if (digitalRead(PIN_HOOK) == HIGH) return false;
+    // Ensure loop yields to system/BLE tasks
+    if (i % 500 == 0) yield();
+    // writeSample handles comfort noise automatically
     writeSample(0);
   }
   return true;
@@ -528,6 +551,7 @@ bool playBirdSquawks(const char* birdName, int squawkCount, int numSquawks) {
 
   DLOG("[Bird] Playing %d squawk(s)\n", numSquawks);
 
+  // Initial silence (with hiss)
   if (!writeSilenceChecked(BIRD_PAUSE_BEFORE_MS)) return false;
 
   for (int i = 0; i < numSquawks; i++) {
@@ -535,7 +559,12 @@ bool playBirdSquawks(const char* birdName, int squawkCount, int numSquawks) {
     char path[64];
     snprintf(path, sizeof(path), "/audio/squawk_%s_%d.wav", birdName, idx);
     DLOG("[Bird]   %s\n", path);
+    
     if (!playWavFile(path)) return false;
+
+    // Small extra silence buffer to ensure hiss continues immediately after file closes
+    if (!writeSilenceChecked(50)) return false;
+
     if (i < numSquawks - 1) {
       if (!writeSilenceChecked(BIRD_PAUSE_BETWEEN_MS)) return false;
     }
@@ -553,9 +582,19 @@ float vadSmoothedEnergy = 0.0f;
 float vadSmoothedZCR    = 0.0f;
 
 void vadWarmup() {
-  for (int i = 0; i < 200; i++) { analogRead(PIN_MIC_ADC); delayMicroseconds(100); }
+  // Read ADC to establish DC midpoint bias, while keeping DMA fed to avoid silence during warmup.
+  // Interleave short bursts of I2S writes to prevent DMA buffer drain.
+  for (int i = 0; i < 200; i++) {
+    if (i % 50 == 0) writeSilenceMs(5);  // refill DMA every 50 ADC reads (~5ms)
+    analogRead(PIN_MIC_ADC);
+    delayMicroseconds(100);
+  }
   int32_t sum = 0;
-  for (int i = 0; i < 100; i++) { sum += analogRead(PIN_MIC_ADC); delayMicroseconds(100); }
+  for (int i = 0; i < 100; i++) {
+    if (i % 50 == 0) writeSilenceMs(5);  // refill DMA every 50 ADC reads (~5ms)
+    sum += analogRead(PIN_MIC_ADC);
+    delayMicroseconds(100);
+  }
   vadMidpoint = (float)sum / 100.0f;
   vadSmoothedEnergy = 0.0f;
   vadSmoothedZCR    = 0.0f;
@@ -624,6 +663,7 @@ bool runBirdConversation(const char* birdName, int squawkCount) {
     }
 
     unsigned long now = millis();
+    writeSilenceMs(30);  // pre-fill DMA before VAD sampling
     vadSampleChunk();
     bool speech = vadIsSpeech();
 
@@ -647,8 +687,7 @@ bool runBirdConversation(const char* birdName, int squawkCount) {
 
       if (!writeSilenceChecked(1500)) return false;
 
-      playHangupClick();
-      writeSilenceMs(300);
+      // Returning true signals the main loop to handle the disconnect sequence (including hangup click)
       return true;
     }
 
@@ -748,13 +787,18 @@ bool playRingingPreamble() {
 bool playRingingAndConnect(const char* birdName, int squawkCount) {
   DLOG("[Audio] Ringing...\n");
   if (!playRingingPreamble()) return false;
-  return runBirdConversation(birdName, squawkCount);
+  g_birdConvActive = true;   // full hiss from answer click through conversation
+  bool birdHungUp = runBirdConversation(birdName, squawkCount);
+  g_birdConvActive = false;  // back to half hiss after bird conversation ends
+  if (birdHungUp) lastActivityTime = millis(); // Reset timer for silence delay
+  return birdHungUp;
 }
 
 // ============================================================================
 // EASTER EGG: 867-5309 (Jenny)
-// Plays jenny.wav, then an answering machine beep, then silence until hangup.
-// Returns false (always human-initiated hangup here).
+// Plays jenny.wav, then an answering machine beep, then a trailing beep,
+// and finally transitions to the authentic disconnect sequence.
+// Returns true (machine hung up).
 // ============================================================================
 bool playJennyEasterEgg() {
   DLOG("[Easter] 867-5309 - Jenny!\n");
@@ -765,30 +809,35 @@ bool playJennyEasterEgg() {
   // Brief pause before answering machine beep
   if (!writeSilenceChecked(150)) return false;
 
-  // Classic 1980s answering machine beep: 1400Hz, ~500ms
-  // Gentle 50ms fade-out to avoid a click at the end
-  DLOG("[Easter] Playing answering machine beep\n");
+  // Classic 1980s answering machine start beep: 1400Hz, ~500ms
+  DLOG("[Easter] Playing machine start beep\n");
   toneGen.setTone(1400);
   toneGen.setAmplitude(6000);
-  int steadySamples = SAMPLE_RATE * 950 / 1000;  // 450ms steady
-  int fadeSamples   = SAMPLE_RATE * 50  / 1000;  //  50ms fade-out
-  for (int i = 0; i < steadySamples; i++) {
+  int beepSamples = SAMPLE_RATE * 500 / 1000;
+  for (int i = 0; i < beepSamples; i++) {
     if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return false; }
     writeSample(toneGen.getSample());
   }
-  for (int i = 0; i < fadeSamples; i++) {
+  toneGen.stop();
+
+  // Wait 30 seconds (standard mid-80s answering machine message window)
+  if (!writeSilenceChecked(30000)) return false;
+
+  // Ending beep: same as start beep
+  DLOG("[Easter] Playing machine end beep\n");
+  toneGen.setTone(1400);
+  toneGen.setAmplitude(6000);
+  for (int i = 0; i < beepSamples; i++) {
     if (digitalRead(PIN_HOOK) == HIGH) { toneGen.stop(); return false; }
-    float env = 1.0f - (float)i / fadeSamples;
-    writeSample((int16_t)(toneGen.getSample() * env));
+    writeSample(toneGen.getSample());
   }
   toneGen.stop();
 
-  // Silence until human hangs up (no disconnect tone — it's an answering machine)
-  DLOG("[Easter] Waiting for hangup...\n");
-  while (digitalRead(PIN_HOOK) == LOW) {
-    writeSample(0);
-  }
-  return false;
+  // Brief pause before the mechanical hangup click
+  if (!writeSilenceChecked(500)) return false;
+
+  lastActivityTime = millis(); // Reset timer for silence delay
+  return true; // Machine hung up
 }
 
 // ============================================================================
@@ -826,9 +875,18 @@ void processCompletedNumber() {
     DLOG("[Call] Easter egg: 867-5309\n");
     currentState = STATE_CALL_CONNECTED;
     if (playRingingPreamble()) {
-      playJennyEasterEgg();
+      if (playJennyEasterEgg() && digitalRead(PIN_HOOK) == LOW) {
+        DLOG("[Call] Machine hung up - entering disconnect sequence\n");
+        playHangupClick();
+        currentState = STATE_DISCONNECT;
+        disconnectTonePlayed = false;
+        disconnectStartMs = millis();
+      } else {
+        lastActivityTime = millis();
+      }
+    } else {
+      lastActivityTime = millis();
     }
-    lastActivityTime = millis();
     return;
   }
 
@@ -889,9 +947,6 @@ void handleDialing() {
   }
 }
 
-// 30 seconds of post-disconnect silence before dial tone returns
-#define DISCONNECT_SILENCE_MS  30000
-
 void playDisconnectTone() {
   DLOG("[Audio] Disconnect tone (2 cycles)\n");
   for (int cycle = 0; cycle < 2; cycle++) {
@@ -938,13 +993,24 @@ void handleOffHookWarning() {
       playWavFile("/audio/intercept_offhook.wav");
       interceptRecordingPlayed = true;
     }
+    // High-volume multi-frequency ROH (Receiver Off Hook) Howl
     toneGen.setTone(1400, 2060, 2450, 2600);
     toneGen.setAmplitude(16000);
+    // Authentic ROH Howl pulses: 0.1s on, 0.1s off
     cadence.setCadence(100, 100);
     offHookWarningInitialized = true;
-    DLOG("[Audio] Off-hook warning tone started\n");
+    DLOG("[Audio] Off-hook warning (ROH Howler) started\n");
   }
-  writeSample(cadence.isActive() ? toneGen.getSample() : 0);
+
+  // Debug: Log cadence state every 100ms
+  static unsigned long lastLog = 0;
+  bool active = cadence.isActive();
+  if (millis() - lastLog > 100) {
+    // DLOG("[Howl] active=%d\n", active); // Uncomment if still failing
+    lastLog = millis();
+  }
+
+  writeSample(active ? toneGen.getSample() : 0);
 }
 
 // ============================================================================
@@ -953,6 +1019,9 @@ void handleOffHookWarning() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Seed random generator for authentic hiss and bird logic
+  srand(analogRead(PIN_MIC_ADC) ^ millis());
 
   // Load config from NVS (or defaults if first boot)
   cfg.load();
