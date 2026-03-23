@@ -69,14 +69,14 @@ BleDebug      bleDebug;
 // ============================================================================
 // PIN DEFINITIONS
 // ============================================================================
+#define PIN_PULSE     2   // D0 - Pulses HIGH for each digit
 #define PIN_IN_USE    1   // D1 - LOW when dialing
-#define PIN_PULSE     2   // D2 - Pulses HIGH for each digit
-#define PIN_HOOK      3   // D3 - LOW when receiver off hook
-#define PIN_MIC_ADC   4   // A4 - Carbon mic analog input (for VAD)
+#define PIN_HOOK      3   // D2 - LOW when receiver off hook
+#define PIN_MIC_ADC   6   // A5 - Carbon mic analog input (for VAD)
 
-#define PIN_I2S_BCLK  7  // D8
-#define PIN_I2S_LRC   8  // D9
-#define PIN_I2S_DOUT  9  // D10
+#define PIN_I2S_DOUT  9  // D8
+#define PIN_I2S_BCLK  10  // D9
+#define PIN_I2S_LRC   11  // D10
 
 // ============================================================================
 // CONSTANTS
